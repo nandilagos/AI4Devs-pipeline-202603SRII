@@ -90,8 +90,11 @@ jobs:
       - name: Add EC2 host to known_hosts
         run: ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
       - name: Sync build to EC2
-        # Trailing /backend/ on the source avoids nesting a backend/ dir inside the deploy path.
-        run: rsync -avz --delete ./artifact/backend/ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
+        # upload-artifact@v4 strips the common `backend/` prefix, so the artifact
+        # contents (dist/, package*.json, prisma/) sit at the root of ./artifact.
+        # --exclude protects server-only files (.env with DATABASE_URL, node_modules)
+        # from --delete, since they are not part of the artifact.
+        run: rsync -avz --delete --exclude='.env' --exclude='node_modules' ./artifact/ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
       - name: Install deps, run migrations and (re)start with PM2
         # The unquoted heredoc lets the runner expand $DEPLOY_PATH locally before
         # sending the script. `npx prisma generate` is mandatory: with --omit=dev the
