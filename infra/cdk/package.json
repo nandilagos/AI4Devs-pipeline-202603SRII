@@ -1,0 +1,22 @@
+{
+  "name": "lti-backend-infra",
+  "version": "1.0.0",
+  "description": "AWS CDK stack that provisions the EC2 deploy target for the LTI backend",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy",
+    "diff": "cdk diff"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "aws-cdk": "^2.150.0",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.150.0",
+    "constructs": "^10.3.0"
+  }
+}

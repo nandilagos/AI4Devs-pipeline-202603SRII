@@ -512,3 +512,58 @@ Para que el flujo de trabajo de GitHub Actions funcione correctamente, debes con
 - [ ] He incluido evidencia de que todo funciona (capturas, enlaces)
 
 **Recuerda**: El objetivo es demostrar que puedes crear y mantener un pipeline de CI/CD funcional. La validación en tu propio fork es fundamental antes de solicitar la revisión del instructor.
+
+---
+
+## Pipeline CI/CD
+
+El pipeline vive en [`.github/workflows/pipeline.yml`](.github/workflows/pipeline.yml) y construye, testea y despliega **solo el backend**.
+
+### Disparo
+
+Se ejecuta con el evento `pull_request` (tipos `opened`, `synchronize`, `reopened`) contra `main`. En la práctica:
+
+> **Un push a una rama que tiene un Pull Request abierto contra `main`** dispara el evento `synchronize` → el pipeline corre. No hay filtro `paths`, así que cualquier push a esa rama lo dispara.
+
+### Flujo
+
+```
+push a rama con PR abierto (pull_request: opened / synchronize / reopened)
+        │
+        ▼
+   ┌─────────┐     needs      ┌─────────┐     needs      ┌──────────┐
+   │  test   │ ─────────────▶ │  build  │ ─────────────▶ │  deploy  │
+   └─────────┘                └─────────┘                └──────────┘
+   unitarios                  tsc → dist/                rsync + SSH a EC2
+   (mockean Prisma,           artifact                   npm ci --omit=dev
+    sin BD)                   "backend-build"            prisma generate
+                                                         prisma migrate deploy
+                                                         pm2 reload/start
+```
+
+- **test** — `npm ci` → `npx prisma generate` → `npm test` (Jest, sin base de datos: los tests mockean `@prisma/client`).
+- **build** — compila con `tsc` y sube el artifact `backend-build` (`dist/`, `package.json`, `package-lock.json`, `prisma/`).
+- **deploy** — descarga el artifact, lo sincroniza por `rsync` sobre SSH a la EC2 y, vía SSH, instala dependencias de producción, genera el cliente Prisma, aplica migraciones y (re)arranca el proceso con PM2.
+
+### Secretos requeridos en GitHub
+
+`Settings → Secrets and variables → Actions`:
+
+| Secreto | Usado por el workflow | Valor |
+|---|---|---|
+| `EC2_SSH_KEY` | ✅ | Contenido completo del archivo `.pem` (clave privada SSH) |
+| `EC2_INSTANCE` | ✅ | IP pública / DNS de la EC2 |
+| `EC2_SSH_USER` | ✅ | `ubuntu` |
+| `EC2_DEPLOY_PATH` | ✅ | `/home/ubuntu/lti-backend` |
+| `AWS_ACCESS_ID` | ❌ (solo cumplimiento) | No referenciado: el deploy es SSH puro, sin AWS CLI/SDK |
+| `AWS_ACCESS_KEY` | ❌ (solo cumplimiento) | Igual que el anterior |
+
+> `DATABASE_URL` **no** es secreto de GitHub: vive en el `.env` de la EC2 (lo colocas manualmente la primera vez) y lo consume `schema.prisma` vía `env("DATABASE_URL")`.
+
+### Provisioning de la EC2
+
+La instancia de destino se crea con AWS CDK. Ver [`infra/cdk/README.md`](infra/cdk/README.md) para los comandos de `cdk bootstrap` / `cdk deploy` y los parámetros `--context`.
+
+### Monitorear el pipeline
+
+En GitHub, pestaña **Actions** → workflow **"Backend CI/CD Pipeline"**. Cada push a una rama con PR abierto crea una ejecución; entra en ella para ver el log de cada job (`test` → `build` → `deploy`) en tiempo real. El PR también muestra los checks del pipeline en su parte inferior.

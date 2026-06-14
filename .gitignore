@@ -25,4 +25,14 @@ yarn-error.log*
 .idea
 .vscode
 
+# AWS CDK (infra/cdk)
+infra/cdk/node_modules/
+infra/cdk/cdk.out/
+infra/cdk/dist/
+# Regenerated on first authenticated `cdk synth`/`deploy`; do not commit dummy lookups
+infra/cdk/cdk.context.json
+
+# AWS key pairs — never commit private keys
+*.pem
+
 # .env

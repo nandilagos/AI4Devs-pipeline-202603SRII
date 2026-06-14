@@ -1,0 +1,94 @@
+name: Backend CI/CD Pipeline
+
+# Trigger: a push to a branch that has an OPEN pull request against main fires the
+# `synchronize` event; `opened`/`reopened` cover the PR being created/reopened.
+# No `paths` filter on purpose, so the pipeline always runs on those PR pushes.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+jobs:
+  # 1) Unit tests. They mock @prisma/client, so NO database is needed.
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # Dummy value: `prisma generate` requires DATABASE_URL to exist, but it does
+      # not open a connection. The tests never touch a real DB.
+      DATABASE_URL: postgresql://user:pass@localhost:5432/db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm test
+
+  # 2) Compile the backend and upload the build artifact.
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      DATABASE_URL: postgresql://user:pass@localhost:5432/db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-build
+          # upload-artifact@v4 keeps the `backend/` prefix inside the artifact.
+          path: |
+            backend/dist/
+            backend/package.json
+            backend/package-lock.json
+            backend/prisma/
+
+  # 3) Deploy to the EC2 over SSH (rsync the build, then install/migrate/restart).
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-build
+          # Files land under ./artifact/backend/... because of the v4 prefix.
+          path: ./artifact
+      - name: Prepare ~/.ssh
+        run: mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+      - name: Add EC2 host to known_hosts
+        run: ssh-keyscan -H ${{ secrets.EC2_INSTANCE }} >> ~/.ssh/known_hosts
+      - name: Sync build to EC2
+        # Trailing /backend/ on the source avoids nesting a backend/ dir inside the deploy path.
+        run: rsync -avz --delete ./artifact/backend/ ${{ secrets.EC2_SSH_USER }}@${{ secrets.EC2_INSTANCE }}:${{ secrets.EC2_DEPLOY_PATH }}/
+      - name: Install deps, run migrations and (re)start with PM2
+        # GitHub Actions expands ${{ secrets.* }} on the runner before the heredoc is
+        # sent, so the remote shell receives the resolved values. `npx prisma generate`
+        # is mandatory: with --omit=dev the prisma CLI/client is not installed otherwise.
+        run: |
+          ssh ${{ secrets.EC2_SSH_USER }}@${{ secrets.EC2_INSTANCE }} 'bash -s' <<'EOF'
+          set -e
+          cd ${{ secrets.EC2_DEPLOY_PATH }}
+          npm ci --omit=dev
+          npx prisma generate
+          npx prisma migrate deploy
+          pm2 reload lti-backend || pm2 start dist/index.js --name lti-backend
+          EOF
