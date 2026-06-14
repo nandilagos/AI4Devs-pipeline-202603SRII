@@ -24,26 +24,21 @@ export class LtiBackendStack extends cdk.Stack {
 
     // --- Required / optional context parameters -------------------------------
     const keyName = this.requireContext('keyName');
-    const myIp = this.requireContext('myIp'); // e.g. 203.0.113.10/32
     const dbPassword = this.requireContext('dbPassword');
     const dbUser = this.node.tryGetContext('dbUser') ?? 'LTIdbUser';
     const dbName = this.node.tryGetContext('dbName') ?? 'LTIdb';
-
-    if (!/\/\d{1,2}$/.test(myIp)) {
-      throw new Error(
-        `Context "myIp" must be a CIDR block, e.g. --context myIp=203.0.113.10/32 (got "${myIp}")`,
-      );
-    }
 
     // --- Network --------------------------------------------------------------
     const vpc = ec2.Vpc.fromLookup(this, 'DefaultVpc', { isDefault: true });
 
     const securityGroup = new ec2.SecurityGroup(this, 'BackendSg', {
       vpc,
-      description: 'LTI backend EC2 - SSH (restricted) and app port 3010',
+      description: 'LTI backend EC2 - SSH and app port 3010',
       allowAllOutbound: true,
     });
-    securityGroup.addIngressRule(ec2.Peer.ipv4(myIp), ec2.Port.tcp(22), 'SSH from operator IP only');
+    // SSH is open to the world so GitHub Actions hosted runners (dynamic IPs) can
+    // deploy over SSH. Authentication is key-only (the .pem); password login is off.
+    securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(22), 'SSH (key-only) - open for CI runners');
     securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(3010), 'LTI backend app port');
     // No Nginx is installed, so port 80 is intentionally NOT opened. The backend
     // is reached directly on http://<public-ip>:3010 (served by PM2).
