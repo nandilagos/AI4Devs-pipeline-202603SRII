@@ -286,6 +286,274 @@ El prompt define explícitamente para cada etapa: objetivo, acciones, restriccio
 
 ---
 
+# Parte 2 — Ejecución en Claude Code
+
+> A partir de aquí, las interacciones corresponden a la **sesión real de ejecución** en Claude Code (modelo Opus 4.8, 1M de contexto). El plan de la Parte 1 evolucionó al contacto con el código y con AWS: varias "decisiones consolidadas" se ajustaron (tests sin Postgres, sin Docker en la EC2, sin filtro `paths`, etc.). Se documentan los cambios y el porqué.
+
+## Iteración 7 — Lectura del plan y preguntas de alcance
+
+### Prompt del usuario
+
+> Lee el archivo plan.md y comprendelo. Luego yo indicaré cuando ejecutar.
+>
+> *(y a continuación)* El plan está creado para completar la siguiente tarea: crear un pipeline en GitHub Actions que tras "push a una rama con un Pull Request abierto" pase tests de backend, genere un build y despliegue en EC2 [...]. **No asumas nada, hazme todas las preguntas. No se pueden instalar librerías fuera del pipeline, solo utilizar lo que hay e instalar lo que tenga que ver con CDK.**
+
+### Restricción nueva y su impacto
+
+La regla *"no instalar librerías fuera del pipeline, solo CDK"* modificó el plan:
+- **Etapa 3**: `actionlint` / `yamllint` ya no se instalan → validación del YAML por otros medios.
+- **Etapa 4**: `act` no se instala → SKIP.
+- **CDK**: sí se permite `npm install` dentro de `infra/cdk/`.
+
+### Preguntas formuladas y respuestas
+
+| # | Pregunta | Respuesta |
+|---|---|---|
+| 1 | Validación del YAML / dry-run sin instalar | Usar herramientas **solo si ya están instaladas**; si no, SKIP. |
+| 2 | VPC del stack CDK | **VPC default** (sin coste de red extra). |
+| 3 | Región AWS | **us-east-1**. |
+| 4 | `DATABASE_URL` en el deploy | **Solo en el `.env` de la EC2**; el workflow no la inyecta → 4 secretos efectivos. |
+
+---
+
+## Iteración 8 — Alineación con los requerimientos y prompts
+
+### Prompt del usuario
+
+> ¿El plan está alineado con los requerimientos ya entregados?
+>
+> *(y luego)* Los prompts los agregaremos al final.
+
+### Conclusión
+
+El plan cubre el 100% de lo técnico (trigger por `pull_request`, jobs `test → build → deploy`, `pipeline.yml`, deploy a EC2). Dos matices:
+1. El entregable "documentar los prompts" se delega al usuario al final (este archivo).
+2. El script CDK es un extra no pedido literalmente pero necesario (sin EC2 no hay dónde desplegar).
+
+---
+
+## Iteración 9 — Etapa 1: Descubrimiento del backend (read-only)
+
+### Prompt del usuario
+
+> Comienza con la etapa 1.
+
+### Hallazgos (con evidencia leída del código)
+
+- **Scripts npm**: `build: tsc`, `test: jest`, `start: node dist/index.js`. Deps clave: `express`, `@prisma/client ^5.13`, `typescript ^4.9`, `jest ^29` + `ts-jest`. **Sin campo `engines`**.
+- **Build output**: `dist/` (confirmado en `tsconfig.json`).
+- **Veredicto tests → NO necesitan Postgres**: los 4 `*.test.ts` usan `jest.mock('@prisma/client')` o mockean el servicio. Nunca llaman `$connect`. **Esto contradijo la suposición del plan original** (que asumía `services:` Postgres y `migrate deploy` en el job de test).
+- **`jest.config.js` SÍ existe** (preset ts-jest) → `npm test` funciona.
+- `schema.prisma`: `url` **hardcodeada** → habrá que cambiarla a `env("DATABASE_URL")`.
+- `.env`: `DATABASE_URL` compuesta por interpolación de `DB_USER`/`DB_PASSWORD`/`DB_PORT`/`DB_NAME`.
+
+### Cambio de rumbo respecto al plan
+
+El job `test` **no llevará `services:` Postgres ni `migrate deploy`** (serían inútiles y romperían el job). Solo `npm ci → prisma generate (con DATABASE_URL dummy) → npm test`.
+
+---
+
+## Iteración 10 — Etapa 2: Script CDK para la EC2
+
+### Prompt del usuario
+
+> Continua. No debes asumir nada, pregúntame todo.
+
+### Preguntas y respuestas
+
+| # | Pregunta | Respuesta |
+|---|---|---|
+| 1 | ¿Docker en la EC2? | **Quitar Docker** (el deploy usa PM2 directo, no Docker). |
+| 2 | Nombres de BD en CDK | **Alinear con el `.env`**: `dbUser=LTIdbUser`, `dbName=LTIdb`. |
+| 3 | Tamaño EBS | **8 GB** (default del AMI). |
+| 4 | Versión PostgreSQL | **PostgreSQL 16** vía repo PGDG. |
+
+### Proyecto creado en `infra/cdk/`
+
+`bin/cdk.ts`, `lib/lti-backend-stack.ts`, `cdk.json`, `tsconfig.json`, `package.json`, `README.md`. El stack: VPC default (`fromLookup`), Security Group (22 ← IP operador, 3010 ← mundo), EC2 `t2.micro` Ubuntu 22.04 vía SSM Parameter, Key Pair por nombre, UserData (Node 20 + PM2 + PostgreSQL 16, **sin Docker**), Elastic IP, y Outputs (`PublicIp`, `SshCommand`, `DatabaseUrl`).
+
+### Problemas de síntesis resueltos (troubleshooting real)
+
+1. **Node 24 + ts-node**: el *type-stripping* nativo de Node 24 rompía `ts-node`. Solución: compilar con `tsc` (`app: "npx tsc && node dist/bin/cdk.js"`).
+2. **Colisión de `bin`**: `package.json` declaraba un bin `cdk` → `npx cdk` ejecutaba nuestro `.ts` en vez del CLI real. Solución: eliminar el campo `bin`.
+3. **`Vpc.fromLookup` exige cuenta+región concretas** y, sin credenciales, llama a AWS. Para validar la síntesis offline se sembró un `cdk.context.json` dummy (luego eliminado y gitignored). `cdk synth` produjo el template completo correctamente.
+
+---
+
+## Iteración 11 — Cierre de Etapa 2: Nginx y VPC
+
+### Prompt del usuario
+
+> Continua.
+
+### Dudas resueltas
+
+| Duda | Decisión |
+|---|---|
+| El SG abría el puerto 80 pero no se instala Nginx | **Sin Nginx → cerrar el puerto 80**. Acceso directo por 3010 (PM2). |
+| `cdk synth` real requiere credenciales por `fromLookup` | **Mantener VPC default** (no cambiar a VPC nueva). |
+
+El SG quedó solo con 22 y 3010.
+
+---
+
+## Iteración 12 — Etapa 3: Escritura del workflow
+
+### Prompt del usuario
+
+> Continua y recuerda no asumir nada.
+
+### Acciones
+
+- **Cambio autorizado en `backend/`**: `schema.prisma` → `url = env("DATABASE_URL")` (única excepción).
+- Creado `.github/workflows/pipeline.yml`: trigger `pull_request` (`opened`/`synchronize`/`reopened`) a `main`, **sin filtro `paths`** (para garantizar el disparo en cualquier push a la rama del PR). Jobs `test → build → deploy` encadenados con `needs:`.
+- **Validación sin instalar nada**: `actionlint`/`yamllint`/`act` no instalados → SKIP. Se validó el YAML con `ruby -ryaml` (psych de macOS). Bien formado.
+- Versiones de actions pineadas: `checkout@v4`, `setup-node@v4`, `upload-artifact@v4`, `download-artifact@v4`, `ssh-agent@v0.9.0`.
+
+### Secretos efectivos (4)
+
+`EC2_SSH_KEY`, `EC2_INSTANCE`, `EC2_SSH_USER` (=`ubuntu`), `EC2_DEPLOY_PATH` (=`/home/ubuntu/lti-backend`). `AWS_ACCESS_ID`/`AWS_ACCESS_KEY` se documentan por cumplimiento del README pero **el workflow no los referencia**.
+
+---
+
+## Iteración 13 — Etapa 4: Verificación local (dry-run)
+
+### Prompt del usuario
+
+> Déjalo *(el `ci.yml` vacío)*. Continúa y recuerda no asumir nada.
+
+### Resultados de los 3 chequeos
+
+1. **`act` test job → SKIP** (no instalado). Mitigado ejecutando `npm test` directo → **4/4 PASS**.
+2. **Build manual → PASS**: `npm ci → prisma generate → npm run build`, `dist/index.js` generado.
+3. **CDK smoke test → PASS**: `tsc` OK + `cdk synth` con context dummy.
+
+### Hallazgo
+
+Correr `build` antes de `test` localmente hacía que jest recogiera también los `dist/**/*.test.js` compilados (8 suites, 4 fallando). **No afecta al pipeline**: en CI, `test` corre sin `dist/` → 4/4 PASS. Decisión: no tocar `tsconfig.json` (el artifact incluye los tests compilados, inofensivo).
+
+---
+
+## Iteración 14 — Etapa 5: Documentación final
+
+### Prompt del usuario
+
+> Continua y recuerda no asumir nada.
+>
+> *(más tarde, al ver comandos git)* No hagas cambios en git. Continúa con la ejecución.
+
+### Acciones
+
+- `README.md`: sección **"Pipeline CI/CD"** (diagrama del flujo, tabla de secretos, referencia a `infra/cdk/README.md`, cómo monitorear en Actions).
+- `.gitignore`: añadido bloque CDK (`node_modules/`, `cdk.out/`, `dist/`, `cdk.context.json`) y `*.pem`. **`.env` se dejó como estaba** (comentado a propósito; el `.env` ya estaba commiteado intencionalmente).
+- Sin commit ni operaciones de git mutantes (a petición del usuario).
+
+---
+
+## Iteración 15 — Despliegue real del CDK
+
+### Prompt del usuario
+
+> Arranca el CDK y probemos que funciona.
+
+### Preguntas y respuestas
+
+| Pregunta | Respuesta |
+|---|---|
+| Key Pair | **Crear uno nuevo (`lti-key`)** y descargar el `.pem`. |
+| `dbPassword` | **Generar una fuerte** (32 chars alfanuméricos; `<redactada>`). |
+| Confirmar deploy (recursos facturables) | **Sí, bootstrap + deploy**. |
+
+### Ejecución y troubleshooting real
+
+1. Autenticación AWS (`aws login`) — cuenta `814305870495`, us-east-1.
+2. Creado Key Pair `lti-key` (`.pem` con `chmod 400`).
+3. `cdk bootstrap` — necesitó recibir el `--context` (también sintetiza la app).
+4. **`cdk deploy` falló**: la cuenta **no tenía VPC default** en us-east-1. Se recreó con `aws ec2 create-default-vpc` y se reintentó.
+5. **Deploy exitoso**. Outputs: `PublicIp=34.231.94.94`, `SshCommand`, `DatabaseUrl` (con password `<redactada>`).
+
+### Verificación en la EC2 (SSH)
+
+`cloud-init` done, **Node v20.20.2**, **PM2 7.0.1**, **PostgreSQL 16.14** activo, BD `LTIdb`/`LTIdbUser` con **conexión OK**, deploy dir creado. Se colocó el `.env` con `DATABASE_URL` (chmod 600).
+
+> Prompt intermedio del usuario tras el fallo de la VPC: *"Mi bad. Try it again"*.
+
+---
+
+## Iteración 16 — Secrets, push y primer PR (en el fork)
+
+### Prompt del usuario
+
+> Sí *(configurar secrets + push + PR)*.
+>
+> *(luego)* Listo el push y las credenciales.
+
+### Hallazgos
+
+- **`gh` CLI no instalado** y no se instala (restricción) → no se pueden configurar los GitHub Secrets ni abrir el PR programáticamente. El usuario los configura en la web.
+- Commit del pipeline + infra en rama `feature/cicd-pipeline`; el push lo hizo el usuario (en el entorno del agente no había credenciales git).
+
+---
+
+## Iteración 17 — Corrección de errores del pipeline en ejecución
+
+### Prompts del usuario (logs pegados del job `deploy`)
+
+> `Run ssh-keyscan -H *** ...` → `Error: Process completed with exit code 1`.
+>
+> `rsync ... "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"` → `Unexpected remote arg: :***` ... `rsync error (code 1)`.
+>
+> `rsync ... ./artifact/backend/ ...` → `change_dir ".../artifact/backend" failed: No such file or directory`.
+
+### Tres bugs reales encontrados y arreglados
+
+1. **SSH bloqueado por el SG**: el puerto 22 estaba restringido a la IP del operador; los runners de GitHub no entraban. → **Abrir el puerto 22 a `0.0.0.0/0`** (auth solo por clave `.pem`) vía edición del CDK + `cdk deploy`. (Decisión consciente; se preguntó al usuario.)
+2. **Espacios en los secretos**: `EC2_INSTANCE`/`EC2_DEPLOY_PATH` pegados con salto de línea/espacio rompían `rsync`. → El job ahora **recorta whitespace** (`tr -d '[:space:]'`) y exporta a `GITHUB_ENV`.
+3. **Ruta del artifact**: `upload-artifact@v4` **elimina el prefijo común `backend/`**; la fuente correcta del `rsync` es `./artifact/` (no `./artifact/backend/`). Además se añadió `--exclude='.env' --exclude='node_modules'` para que `--delete` no borre el `.env` con la `DATABASE_URL` de la EC2.
+
+> Prompts del usuario en esta iteración: *"make the commit I will push"* y *"continua"*. Los commits los creó el agente; el push lo hizo el usuario.
+
+---
+
+## Iteración 18 — Rama limpia para el PR al repositorio padre
+
+### Prompt del usuario
+
+> Necesito que eliminemos la infra de esta rama para hacer el PR hacia la rama main del repositorio padre.
+
+### Contexto
+
+El trabajo completo (pipeline + infra) ya estaba en `feature/cicd-pipeline` y mergeado al `main` del fork (PR #1). Para el PR al **repo padre** (`LIDR-academy`) se usó una rama limpia `pipeline-ALJ` (desde el commit inicial).
+
+### Decisiones y acciones
+
+| Pregunta | Respuesta |
+|---|---|
+| Contenido del PR al padre | **Solo `pipeline.yml`** (schema y README originales). |
+| Limpieza del working tree | Eliminar **infra/ + lti-key.pem + CLAUDE.md + plan.md**. |
+| Scope del commit | `pipeline.yml` + `prompts-ALJ.md` + borrado de `prompts.md`. |
+
+- `pipeline.yml` traído desde `main` (versión final con los 3 fixes).
+- **`lti-key.pem` preservado fuera del repo** (`~/lti-key.pem`) en vez de borrarlo (es la clave privada de acceso a la EC2).
+- `infra/`, `CLAUDE.md`, `plan.md` eliminados del working tree.
+- Commit `d308642` en `pipeline-ALJ`, listo para el PR cross-fork a `LIDR-academy:main`.
+
+### Nota sobre el comportamiento en el repo padre
+
+`test` y `build` pasan; el job `deploy` **no se ejecuta con éxito en el PR al padre** porque los PRs desde un fork no reciben los secrets del repo base. La demostración del deploy real quedó en el fork.
+
+---
+
+## Iteración 19 — Documentación de los prompts
+
+### Prompt del usuario
+
+> Al archivo prompts-ALJ.md, agrégale todas nuestras interacciones, sigue el mismo patrón.
+
+Esta Parte 2 es el resultado: la traza completa de la ejecución en Claude Code, con los prompts del usuario, las decisiones tomadas en cada pausa y los bugs reales encontrados y corregidos durante el despliegue y las ejecuciones del pipeline.
+
+---
+
 ## Referencias
 
 - Repositorio: https://github.com/nandilagos/AI4Devs-pipeline-202603SRII
